@@ -34,6 +34,9 @@ import tensorflow_datasets.public_api as tfds
 # WET file constants
 _PAGE_DELIMITER = "WARC/1.0"
 _URL_KEY = "WARC-Target-URI:"
+_URL_DATE = "WARC-Date:"
+_CONTENT_TYPE = "Content-Type:"
+_CONTENT_LEN = "Content-Length:"
 _METADATA_PREFIXES = ("WARC", "CONTENT-", "Content-")
 
 # Filters
@@ -85,7 +88,8 @@ def _get_sentences_by_line(text, lower=False):
 
 def is_language(page, language, min_probability=0.99):
   """Returns True iff text is in `language` with at least `min_probability`."""
-  unused_url, text = page
+  unused_url, features = page
+  text = features["text"]
 
   counter_inc_fn = get_counter_inc_fn("detected-lang")
 
@@ -125,7 +129,9 @@ def get_clean_page_fn(badwords=None):
       clean_page, citation_regex=citation_regex, badwords_regex=badwords_regex)
 
 
-def clean_page(url_and_text, citation_regex, badwords_regex=None,
+def clean_page(url_and_features,
+               citation_regex,
+               badwords_regex=None,
                counter_inc_fn=None,
                min_words_per_line=_MIN_WORDS_PER_LINE,
                min_num_sentences=_MIN_NUM_SENTENCES):
@@ -136,7 +142,7 @@ def clean_page(url_and_text, citation_regex, badwords_regex=None,
   simple count of end marks.
 
   Args:
-    url_and_text: tuple(string, string), the url and raw text of the page.
+    url_and_features: tuple(string, dict), the url and features of the page.
     citation_regex: Regex to use for finding Wikipedia-like citations to filter.
     badwords_regex: Regex to use for finding badwords. Default None, which means
       don't apply badwords filtering.
@@ -149,7 +155,9 @@ def clean_page(url_and_text, citation_regex, badwords_regex=None,
   Yields:
     The url and cleaned text for the page.
   """
-  url, text = url_and_text
+  url, features = url_and_features
+  text = features["text"]
+
   if not counter_inc_fn:
     counter_inc_fn = get_counter_inc_fn("clean-page")
 
@@ -197,12 +205,14 @@ def clean_page(url_and_text, citation_regex, badwords_regex=None,
     counter_inc_fn("filtered-url-toofewsentences")
     return
   counter_inc_fn("emitted-clean-pages")
-  yield url, "\n".join(valid_lines).strip()
+  features["text"] = "\n".join(valid_lines).strip()
+  yield url, features
 
 
 def _emit_url_to_sentences(page, max_window_size):
   """Emits url to all (lower-cased) sentences grouped by sliding window."""
-  url, text = page
+  url, features = page
+  text = features["text"]
   for sentences in _get_sentences_by_line(text, lower=True):
     # We don't want to emit windows where all "sentences" are just endmarks
     # (e.g., "! ! !").
@@ -258,9 +268,12 @@ def _remove_sentences_from_text(
     text: The text of the page with sentences removed.
   """
   url, join_values = el
-  text = join_values["text"]
-  assert len(text) == 1, "Invalid page count (%d) for %s" % (len(text), url)
-  text = text[0]
+  features = join_values["features"]
+
+  assert len(features) == 1, "Invalid page count (%d) for %s" % (len(features),
+                                                                 url)
+  features = features[0]
+  text = features["text"]
   sentences_to_remove = set(join_values["sentences"])
   sentences_by_line = _get_sentences_by_line(text, lower=False)
   new_sentences_by_line = []
@@ -280,7 +293,8 @@ def _remove_sentences_from_text(
   if sum(len(sents) for sents in new_sentences_by_line) < min_num_sentences:
     counter_inc_fn("filtered-doc-toofewsentences")
     return
-  yield (url, "\n".join(" ".join(sent) for sent in new_sentences_by_line))
+  features["text"] = "\n".join(" ".join(sent) for sent in new_sentences_by_line)
+  yield (url, features)
 
 
 def remove_duplicate_text(pages, sentence_window_size=3):
@@ -297,7 +311,7 @@ def remove_duplicate_text(pages, sentence_window_size=3):
 
   # Output: url, text
   final_docs = (
-      {"text": pages, "sentences": sentences_to_remove}
+      {"features": pages, "sentences": sentences_to_remove}
       | "group_text_and_sentences_by_url" >> beam.CoGroupByKey()
       | beam.FlatMap(_remove_sentences_from_text,
                      max_window_size=sentence_window_size,
@@ -317,15 +331,30 @@ def split_wet_file(wet_file_path, counter_inc_fn=None):
       fileobj=f) as g:
     url = None
     content = None
+    content_len = None
+    content_type = None
+    timestamp = None
 
     def _maybe_get_page():
       if not url and url is not None:
         counter_inc_fn("page-filitered-nourl")
       if not content and content is not None:
         counter_inc_fn("page-filtered-nocontent")
+      if not content_type:
+        counter_inc_fn("page-filtered-nocontenttype")
+      if not content_len:
+        counter_inc_fn("page-filtered-nocontentlen")
+      if not timestamp:
+        counter_inc_fn("page-filtered-notimestamp")
       if content and url:
         counter_inc_fn("page-emitted")
-        return (url, "\n".join(content))
+        return (url, {
+            "text": "\n".join(content),
+            "content-type": content_type,
+            "content-length": content_len,
+            "timestamp": timestamp,
+            "url": url
+        })
       return None
 
     for line in io.TextIOWrapper(g, encoding="utf-8"):
@@ -338,9 +367,21 @@ def split_wet_file(wet_file_path, counter_inc_fn=None):
           yield page
         url = ""
         content = []
+        content_len = None
+        content_type = None
+        timestamp = None
 
       if line.startswith(_URL_KEY):
         url = line[len(_URL_KEY):].strip()
+
+      if line.startswith(_URL_DATE):
+        timestamp = line[len(_URL_DATE):].strip()
+
+      if line.startswith(_CONTENT_TYPE):
+        content_type = line[len(_CONTENT_TYPE):].strip()
+
+      if line.startswith(_CONTENT_LEN):
+        content_len = line[len(_CONTENT_LEN):].strip()
 
       if line.startswith(_METADATA_PREFIXES):
         continue
